@@ -90,3 +90,16 @@ fn test_ltar_truncated() {
     }
   }
 }
+
+#[test]
+fn test_ltar_empty_private() {
+  let src = build_dir();
+  let archive = pack(src.path(), true);
+  let dir = tempfile::tempdir().unwrap();
+  let base = [PathBuf::from(dir.path())];
+  ltar::unpack_with(&base, Cursor::new(&archive[..]), true, None, false, true).ok().unwrap();
+  for f in ["Attr.olean", "Attr.olean.server", "Attr.ilean"] {
+    assert!(fs::read(src.path().join(f)).unwrap() == fs::read(dir.path().join(f)).unwrap(), "{f}");
+  }
+  assert!(fs::read(dir.path().join("Attr.olean.private")).unwrap().is_empty());
+}

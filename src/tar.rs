@@ -98,6 +98,9 @@ fn main() {
       \n\
       \ndecompress opts:\
       \n  -f          Always unpack even if a matching trace file exists\
+      \n  --empty-private\
+      \n              Write each module's .olean.private as an empty file, without\
+      \n              decoding it (for a build that never reads it)\
       \n  -j          Read the '-' stdin input as JSON (default: one filename per line)\
       \n  -r, --delete-corrupted\
       \n              Delete input FILE.ltar files if they fail parsing\
@@ -114,6 +117,7 @@ fn main() {
   let mut do_show_comments = false;
   let mut verbose = false;
   let mut force = false;
+  let mut empty_private = false;
   let mut from_stdin = false;
   let mut json_stdin = false;
   let mut delete_corrupted = false;
@@ -141,6 +145,10 @@ fn main() {
       }
       "-f" => {
         force = true;
+        args.next();
+      }
+      "--empty-private" => {
+        empty_private = true;
         args.next();
       }
       "-j" => {
@@ -332,7 +340,7 @@ fn main() {
         }
         e => io::Cursor::new(e.unwrap()),
       };
-      if let Err(e) = ltar::unpack(&basedirs, tarfile, force, hash, verbose) {
+      if let Err(e) = ltar::unpack_with(&basedirs, tarfile, force, hash, verbose, empty_private) {
         if matches!(&e, UnpackError::IOError(e)
           if matches!(e.kind(), io::ErrorKind::UnexpectedEof))
         {

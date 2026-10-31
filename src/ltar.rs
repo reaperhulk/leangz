@@ -501,7 +501,17 @@ fn get_version<R: BufRead>(tarfile: &mut R) -> Result<LtarVersion, UnpackError> 
 }
 
 pub fn unpack<R: BufRead + Seek>(
+  basedir: &[PathBuf], tarfile: R, force: bool, trace_override: Option<u64>, verbose: bool,
+) -> Result<u64, UnpackError> {
+  unpack_with(basedir, tarfile, force, trace_override, verbose, false)
+}
+
+/// `unpack`, but with `empty_private`, a module's `.olean.private` is written as an
+/// empty file, without decoding it: a placeholder for a build that never reads it
+/// (Lake only checks that it exists), which saves most of the writing.
+pub fn unpack_with<R: BufRead + Seek>(
   basedir: &[PathBuf], mut tarfile: R, force: bool, trace_override: Option<u64>, verbose: bool,
+  empty_private: bool,
 ) -> Result<u64, UnpackError> {
   let version = get_version(&mut tarfile)?;
   let mut buf = vec![];
@@ -608,6 +618,7 @@ pub fn unpack<R: BufRead + Seek>(
         extra,
         &mut buf,
         &mut uncommitted,
+        empty_private,
       )?
     }
   }
@@ -629,6 +640,7 @@ pub fn unpack<R: BufRead + Seek>(
           extra,
           &mut buf,
           &mut uncommitted,
+          empty_private,
         )?;
       }
     } else if read_cstr(&mut buf, &mut tarfile)? {
@@ -654,7 +666,7 @@ pub fn unpack<R: BufRead + Seek>(
 fn unpack_one<R: BufRead>(
   _version: LtarVersion, tarfile: &mut R, trace_override: Option<u64>, verbose: bool,
   path: PathBuf, compression: u8, extra: Vec<PathBuf>, buf: &mut Vec<u8>,
-  uncommitted: &mut Vec<StagedFile>,
+  uncommitted: &mut Vec<StagedFile>, empty_private: bool,
 ) -> Result<(), UnpackError> {
   if verbose {
     println!("copying {}, compression = {compression}", path.display());
@@ -677,6 +689,14 @@ fn unpack_one<R: BufRead>(
       uncommitted.push(file.stage());
     }
     COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => {
+      // The parts are the `.olean`, then (a module's) `.olean.server` and `.olean.private`,
+      // decoded in that order: to leave the last out, decode one fewer.
+      let mut extra = extra;
+      let placeholder = if empty_private && compression == COMPRESSION_LGZ_MODULE {
+        extra.pop()
+      } else {
+        None
+      };
       let (out, ranges) = with_payload(tarfile, buf, |data| {
         #[cfg(feature = "zstd")]
         return with_decoders(|d| {
@@ -693,6 +713,9 @@ fn unpack_one<R: BufRead>(
         let mut file = TempFile::new(path)?;
         file.write_all(&out[r])?;
         uncommitted.push(file.stage());
+      }
+      if let Some(path) = placeholder {
+        uncommitted.push(TempFile::new(path)?.stage());
       }
     }
     COMPRESSION_HASH_PLAIN => {
