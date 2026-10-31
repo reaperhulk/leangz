@@ -19,7 +19,13 @@ impl std::ops::DerefMut for TempFile {
 
 impl TempFile {
   pub fn new(path: PathBuf) -> io::Result<Self> {
-    Ok(TempFile { file: NamedTempFile::new_in(path.parent().unwrap_or(&path))?, path })
+    let dir = path.parent().unwrap_or(&path);
+    let mut builder = tempfile::Builder::new();
+    // The file is renamed into place, so give it the permissions a new file
+    // gets (subject to the umask), not a temporary file's owner-only ones.
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    Ok(TempFile { file: builder.tempfile_in(dir)?, path })
   }
 
   pub fn save(self) -> io::Result<PathBuf> {

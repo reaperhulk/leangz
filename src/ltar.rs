@@ -4,7 +4,7 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{self, BufRead, ErrorKind, Seek, Write};
+use std::io::{self, BufRead, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::lgz;
@@ -13,6 +13,91 @@ use crate::lgz;
 const COMPRESSION_LEVEL: i32 = 19;
 #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
 const DICT_V1: &[u8] = include_bytes!("../dict/v1.dict");
+
+/// Zstd decompression contexts, one set per thread, kept across files: making
+/// a context allocates its buffers, and loading the dictionary into one
+/// parses it again, which costs more than decompressing a small file.
+#[cfg(feature = "zstd")]
+struct Decoders {
+  plain: zstd::zstd_safe::DCtx<'static>,
+  #[cfg(feature = "zstd-dict")]
+  dict: zstd::zstd_safe::DCtx<'static>,
+  /// The last decompressed data, kept for its allocation.
+  out: Vec<u8>,
+}
+
+#[cfg(feature = "zstd")]
+fn with_decoders<T>(f: impl FnOnce(&mut Decoders) -> T) -> T {
+  thread_local! {
+    static DECODERS: std::cell::RefCell<Option<Decoders>> = const { std::cell::RefCell::new(None) };
+  }
+  DECODERS.with_borrow_mut(|d| {
+    f(d.get_or_insert_with(|| Decoders {
+      plain: zstd::zstd_safe::DCtx::create(),
+      #[cfg(feature = "zstd-dict")]
+      dict: {
+        let mut dctx = zstd::zstd_safe::DCtx::create();
+        dctx.load_dictionary(DICT_V1).expect("bad zstd dictionary");
+        dctx
+      },
+      out: vec![],
+    }))
+  })
+}
+
+/// Decompresses the zstd frames `src` into `out`, replacing its contents, all
+/// at once: decoding a stream a few bytes at a time (as `lgz::decompress`
+/// reads) costs a call into zstd for each read.
+#[cfg(feature = "zstd")]
+fn zstd_decompress(
+  dctx: &mut zstd::zstd_safe::DCtx<'static>, src: &[u8], out: &mut Vec<u8>,
+) -> io::Result<()> {
+  use zstd::zstd_safe::{InBuffer, OutBuffer, ResetDirective};
+  let err = |code| io::Error::other(zstd::zstd_safe::get_error_name(code));
+  dctx.reset(ResetDirective::SessionOnly).map_err(err)?;
+  out.clear();
+  // The frame's size, if it says (capped, in case the file is corrupt), or a guess.
+  let size = zstd::zstd_safe::get_frame_content_size(src).ok().flatten();
+  out.reserve(size.map_or(4 * src.len(), |n| n.min(64 * src.len() as u64 + 4096) as usize));
+  let mut input = InBuffer::around(src);
+  loop {
+    let pos = out.len();
+    let mut output = OutBuffer::around_pos(out, pos);
+    let left = dctx.decompress_stream(&mut output, &mut input).map_err(err)?;
+    let full = output.pos() == output.capacity();
+    if input.pos() == src.len() {
+      if left == 0 {
+        return Ok(())
+      } else if !full {
+        return Err(ErrorKind::UnexpectedEof.into())
+      }
+    }
+    if full {
+      out.reserve(out.len().max(1 << 16))
+    }
+  }
+}
+
+/// Reads a payload's length and calls `f` on its bytes: in place, if the
+/// reader has them all buffered (a whole file in memory), else copied to `buf`.
+fn with_payload<R: BufRead, T>(
+  tarfile: &mut R, buf: &mut Vec<u8>, f: impl FnOnce(&[u8]) -> Result<T, UnpackError>,
+) -> Result<T, UnpackError> {
+  let len = tarfile.read_u64::<LE>()?;
+  let avail = tarfile.fill_buf()?;
+  if let Some(data) = usize::try_from(len).ok().and_then(|len| avail.get(..len)) {
+    let res = f(data)?;
+    tarfile.consume(len as usize);
+    Ok(res)
+  } else {
+    buf.clear();
+    tarfile.take(len).read_to_end(buf)?;
+    if buf.len() as u64 != len {
+      return Err(UnpackError::IOError(ErrorKind::UnexpectedEof.into()))
+    }
+    f(buf)
+  }
+}
 
 const COMPRESSION_ZSTD: u8 = 0;
 const COMPRESSION_LGZ: u8 = 1;
@@ -453,8 +538,6 @@ pub fn unpack<R: BufRead + Seek>(
       Ok::<_, io::Error>(())
     }
   };
-  #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
-  let dict = zstd::dict::DecoderDictionary::copy(DICT_V1);
   let compression =
     if version < LtarVersion::V2 { COMPRESSION_HASH_PLAIN } else { tarfile.read_u8()? };
   let extra = read_extra(compression, &mut buf, &mut tarfile)?;
@@ -478,8 +561,6 @@ pub fn unpack<R: BufRead + Seek>(
         extra,
         &mut buf,
         &mut uncommitted,
-        #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
-        &dict,
       )?
     }
   }
@@ -501,8 +582,6 @@ pub fn unpack<R: BufRead + Seek>(
           extra,
           &mut buf,
           &mut uncommitted,
-          #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
-          &dict,
         )?;
       }
     } else if read_cstr(&mut buf, &mut tarfile)? {
@@ -529,7 +608,6 @@ fn unpack_one<R: BufRead>(
   _version: LtarVersion, tarfile: &mut R, trace_override: Option<u64>, verbose: bool,
   path: PathBuf, compression: u8, extra: Vec<PathBuf>, buf: &mut Vec<u8>,
   uncommitted: &mut Vec<StagedFile>,
-  #[cfg(all(feature = "zstd", feature = "zstd-dict"))] dict: &zstd::dict::DecoderDictionary<'_>,
 ) -> Result<(), UnpackError> {
   if verbose {
     println!("copying {}, compression = {compression}", path.display());
@@ -539,44 +617,34 @@ fn unpack_one<R: BufRead>(
   }
   match compression {
     COMPRESSION_ZSTD => {
-      buf.clear();
-      buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-      tarfile.read_exact(buf)?;
-      let reader = std::io::Cursor::new(&**buf);
-      #[cfg(feature = "zstd")]
-      let reader = zstd::stream::Decoder::new(reader)?;
       let mut file = TempFile::new(path)?;
-      if let Some(hash) = trace_override {
-        // The depHash was stripped from this opaque trace at pack time; parse the
-        // JSON straight out of the decompression stream and splice it back in,
-        // without needing to understand the rest of the schema.
-        let mut value = serde_json::from_reader::<_, serde_json::Value>(reader)
-          .map_err(|_| UnpackError::BadLtar)?;
-        if let Some(obj) = value
-          .as_object_mut()
-          .filter(|o| o.get("schemaVersion").and_then(|v| v.as_str()) == Some(TRACE_SCHEMA_V3))
-        {
-          obj.insert("depHash".into(), serde_json::Value::String(format!("{hash:016x}")));
-        }
-        file.write_all(&serde_json::to_vec(&value).unwrap())?;
-      } else {
-        std::io::copy(&mut { reader }, &mut *file)?;
-      }
+      with_payload(tarfile, buf, |data| {
+        #[cfg(feature = "zstd")]
+        return with_decoders(|d| {
+          zstd_decompress(&mut d.plain, data, &mut d.out)?;
+          write_trace_or_file(&mut file, &d.out, trace_override)
+        });
+        #[cfg(not(feature = "zstd"))]
+        write_trace_or_file(&mut file, data, trace_override)
+      })?;
       uncommitted.push(file.stage());
     }
     COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => {
-      buf.clear();
-      buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-      tarfile.read_exact(buf)?;
-      let reader = std::io::Cursor::new(&**buf);
-      #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
-      let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, dict)?;
-      #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
-      let reader = zstd::stream::Decoder::new(reader)?;
-      let (buf, ranges) = lgz::decompress(reader, extra.len() + 1);
+      let (out, ranges) = with_payload(tarfile, buf, |data| {
+        #[cfg(feature = "zstd")]
+        return with_decoders(|d| {
+          #[cfg(feature = "zstd-dict")]
+          zstd_decompress(&mut d.dict, data, &mut d.out)?;
+          #[cfg(not(feature = "zstd-dict"))]
+          zstd_decompress(&mut d.plain, data, &mut d.out)?;
+          Ok(lgz::decompress(&*d.out, extra.len() + 1))
+        });
+        #[cfg(not(feature = "zstd"))]
+        Ok(lgz::decompress(data, extra.len() + 1))
+      })?;
       for (r, path) in ranges.into_iter().zip([path].into_iter().chain(extra)) {
         let mut file = TempFile::new(path)?;
-        file.write_all(&buf[r])?;
+        file.write_all(&out[r])?;
         uncommitted.push(file.stage());
       }
     }
@@ -643,6 +711,25 @@ fn unpack_one<R: BufRead>(
     compression => return Err(UnpackError::UnsupportedCompression(compression)),
   }
   Ok(())
+}
+
+/// Writes `data` to `file`, or, with `trace_override`, the JSON trace it holds
+/// with its `depHash` replaced: the hash was stripped from this opaque trace at
+/// pack time, so splice it back in without needing to understand the rest of
+/// the schema.
+fn write_trace_or_file(
+  file: &mut File, data: &[u8], trace_override: Option<u64>,
+) -> Result<(), UnpackError> {
+  let Some(hash) = trace_override else { return Ok(file.write_all(data)?) };
+  let mut value =
+    serde_json::from_slice::<serde_json::Value>(data).map_err(|_| UnpackError::BadLtar)?;
+  if let Some(obj) = value
+    .as_object_mut()
+    .filter(|o| o.get("schemaVersion").and_then(|v| v.as_str()) == Some(TRACE_SCHEMA_V3))
+  {
+    obj.insert("depHash".into(), serde_json::Value::String(format!("{hash:016x}")));
+  }
+  Ok(file.write_all(&serde_json::to_vec(&value).unwrap())?)
 }
 
 fn skip_one<R: BufRead + Seek>(

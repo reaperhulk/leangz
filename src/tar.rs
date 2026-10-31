@@ -205,7 +205,7 @@ fn main() {
 
     let mut error = AtomicBool::new(false);
     let fail = || error.store(true, std::sync::atomic::Ordering::Relaxed);
-    args_vec.into_par_iter().for_each(|Arg { base, file, hash }| {
+    let unpack_one = |Arg { base, file, hash }| {
       if verbose {
         println!("unpacking {file}");
       }
@@ -221,12 +221,14 @@ fn main() {
           }
         }
       }
-      let tarfile = match File::open(&file) {
+      // One read of the whole (compressed) file: `ltar::unpack` then decodes
+      // each payload in place, rather than copying it out of a `BufReader`.
+      let tarfile = match std::fs::read(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
           eprintln!("{file} not found");
           return fail()
         }
-        e => BufReader::new(e.unwrap()),
+        e => io::Cursor::new(e.unwrap()),
       };
       if let Err(e) = ltar::unpack(&basedirs, tarfile, force, hash, verbose) {
         if matches!(&e, UnpackError::IOError(e)
@@ -244,7 +246,13 @@ fn main() {
           fail()
         }
       }
-    });
+    };
+    // Lake unpacks one archive per process: don't start a thread per CPU for it.
+    if args_vec.len() > 1 {
+      args_vec.into_par_iter().for_each(unpack_one)
+    } else {
+      args_vec.into_iter().for_each(unpack_one)
+    }
     std::process::exit(*error.get_mut() as i32);
   } else {
     let tarfile = args.next().unwrap_or_else(|| help_err("expected OUT.ltar"));
