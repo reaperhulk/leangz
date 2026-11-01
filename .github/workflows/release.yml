@@ -4,6 +4,12 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
+  # By hand: releases the commit it runs on as `tag`, which the release creates.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create and release (e.g. v0.1.21-vg.1)"
+        required: true
 
 jobs:
   dist:
@@ -88,6 +94,8 @@ jobs:
     name: Publish
     needs: [dist]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -96,10 +104,14 @@ jobs:
       - run: ls -al bins-*
 
       - name: Calculate tag name
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           name=dev
           if [[ $GITHUB_REF == refs/tags/v* ]]; then
             name=${GITHUB_REF:10}
+          elif [[ -n "$INPUT_TAG" ]]; then
+            name=$INPUT_TAG
           fi
           echo "val=$name" >> "$GITHUB_OUTPUT"
           echo TAG=$name >> $GITHUB_ENV
@@ -144,6 +156,8 @@ jobs:
           file: dist/*
           file_glob: true
           tag: ${{ steps.tagname.outputs.val }}
+          # Where a tag that does not exist yet is created (a run by hand).
+          target_commit: ${{ github.sha }}
           overwrite: true
 
       - name: Extract version
