@@ -33,8 +33,8 @@ fn parse_base(j: &serde_json::Map<String, serde_json::Value>) -> Vec<Option<Path
 
 /// `basedirs` with a record's `base` (see `parse_base`) applied.
 fn apply_base<'a>(
-  basedirs: &'a Vec<PathBuf>, base: &[Option<PathBuf>], file: &str,
-) -> Cow<'a, Vec<PathBuf>> {
+  basedirs: &'a [PathBuf], base: &[Option<PathBuf>], file: &str,
+) -> Cow<'a, [PathBuf]> {
   let mut basedirs = Cow::Borrowed(basedirs);
   for (i, basedir2) in base.iter().enumerate() {
     if let Some(basedir2) = basedir2 {
@@ -254,8 +254,15 @@ fn main() {
         }
         let res = (|| -> io::Result<()> {
           let mut temp = leangz::TempFile::new(out.clone().into())?;
-          ltar::pack_with(&base, BufWriter::new(&mut *temp), &trace, files, include_hash, verbose,
-            Some(comp))?;
+          ltar::pack_with(
+            &base,
+            BufWriter::new(&mut *temp),
+            &trace,
+            files,
+            include_hash,
+            verbose,
+            Some(comp),
+          )?;
           temp.save().map(drop)
         })();
         if let Err(e) = res {
@@ -369,8 +376,15 @@ fn main() {
     let trace_path = args.next().unwrap_or_else(|| help_err("expected FILE.trace"));
     let mut temp = leangz::TempFile::new(tarfile.into()).unwrap();
     let mut comp = level.map(|level| ltar::Compressors::new(Some(level)).unwrap());
-    ltar::pack_with(&basedirs, BufWriter::new(&mut *temp), &trace_path, args, include_hash, verbose,
-      comp.as_mut())
+    ltar::pack_with(
+      &basedirs,
+      BufWriter::new(&mut *temp),
+      &trace_path,
+      args,
+      include_hash,
+      verbose,
+      comp.as_mut(),
+    )
     .unwrap();
     temp.save().unwrap();
   }

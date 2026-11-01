@@ -118,9 +118,10 @@ fn dict_v1_enc(level: i32) -> &'static zstd::dict::EncoderDictionary<'static> {
   static DICTS: Mutex<Option<HashMap<i32, &'static zstd::dict::EncoderDictionary<'static>>>> =
     Mutex::new(None);
   let mut dicts = DICTS.lock().unwrap();
-  *dicts.get_or_insert_with(HashMap::new).entry(level).or_insert_with(|| {
-    Box::leak(Box::new(zstd::dict::EncoderDictionary::copy(DICT_V1, level)))
-  })
+  dicts
+    .get_or_insert_with(HashMap::new)
+    .entry(level)
+    .or_insert_with(|| Box::leak(Box::new(zstd::dict::EncoderDictionary::copy(DICT_V1, level))))
 }
 
 #[cfg(feature = "zstd")]
@@ -692,11 +693,8 @@ fn unpack_one<R: BufRead>(
       // The parts are the `.olean`, then (a module's) `.olean.server` and `.olean.private`,
       // decoded in that order: to leave the last out, decode one fewer.
       let mut extra = extra;
-      let placeholder = if empty_private && compression == COMPRESSION_LGZ_MODULE {
-        extra.pop()
-      } else {
-        None
-      };
+      let placeholder =
+        if empty_private && compression == COMPRESSION_LGZ_MODULE { extra.pop() } else { None };
       let (out, ranges) = with_payload(tarfile, buf, |data| {
         #[cfg(feature = "zstd")]
         return with_decoders(|d| {
@@ -1064,7 +1062,9 @@ pub fn pack_with(
 }
 
 #[cfg_attr(not(feature = "zstd"), allow(unused_variables))]
-fn pack_zstd(data: &[u8], tarfile: &mut impl Write, comp: Option<&mut Compressors>) -> io::Result<()> {
+fn pack_zstd(
+  data: &[u8], tarfile: &mut impl Write, comp: Option<&mut Compressors>,
+) -> io::Result<()> {
   tarfile.write_u8(COMPRESSION_ZSTD)?;
   let mut buf = vec![];
   #[cfg(feature = "zstd")]
