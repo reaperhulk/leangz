@@ -101,7 +101,7 @@ jobs:
           if [[ $GITHUB_REF == refs/tags/v* ]]; then
             name=${GITHUB_REF:10}
           fi
-          echo ::set-output name=val::$name
+          echo "val=$name" >> "$GITHUB_OUTPUT"
           echo TAG=$name >> $GITHUB_ENV
         id: tagname
 
@@ -132,6 +132,10 @@ jobs:
               (cd tmp && 7z a -r ../dist/$pkgname.zip $pkgname)
             fi
           done
+
+          # What a download is checked against (`sha256sum -c`).
+          (cd dist && sha256sum leantar-* > SHA256SUMS)
+          cat dist/SHA256SUMS
 
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
